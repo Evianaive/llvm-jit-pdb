@@ -295,8 +295,10 @@ void JITPDBMemoryManager::reloadDll() {
   fseek(dllFD, DllHackInfoData.TimeStampPos, 0);
   fwrite(&currTime, 4, 1, dllFD);
 
-  // make the memory only readable
-  uint8_t writeHack = 0x60;
+  // set TEXT section as read/write/execute
+  // since DataRW section is contained in TEXT section
+  // 0xE0 = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE
+  uint8_t writeHack = 0xE0;
   fseek(dllFD, DllHackInfoData.SectionInfos[DllHackInfo::TEXT].HeaderPos + 39,
         0);
   fwrite(&writeHack, 1, 1, dllFD);
@@ -477,6 +479,11 @@ void JITPDBMemoryManager::notifyObjectLoaded(ExecutionEngine *EE,
   }
 }
 
+void JITPDBMemoryManager::notifyObjectLoaded(RuntimeDyld& RTDyld,
+    const object::ObjectFile& Obj) {
+  JITPDBMemoryManager::notifyObjectLoaded(nullptr, Obj);
+}
+
 bool JITPDBMemoryManager::finalizeMemory(std::string *ErrMsg) {
   if (StatusValue == Status::OK) // already finalized once
     return false;
@@ -497,7 +504,8 @@ bool JITPDBMemoryManager::finalizeMemory(std::string *ErrMsg) {
     StatusValue = Status::MemoryNotReady;
     return true;
   } else {
-    NotifyModuleEmitted(DllBaseAddress);
+    if (NotifyModuleEmitted)
+      NotifyModuleEmitted(DllBaseAddress);
     StatusValue = Status::OK;
     return false;
   }

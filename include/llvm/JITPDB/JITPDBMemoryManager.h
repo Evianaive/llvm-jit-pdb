@@ -59,6 +59,8 @@ protected:
                                bool IsReadOnly) override;
   void notifyObjectLoaded(ExecutionEngine *EE,
                           const object::ObjectFile &) override;
+  void notifyObjectLoaded(RuntimeDyld& RTDyld,
+                          const object::ObjectFile &) override;
   bool finalizeMemory(std::string *) override;
 
 private:
@@ -117,6 +119,5 @@ private:
   Status StatusValue = Status::Allocating;
   bool Verbose = false;
   bool PDBDontEmit = false;
-};
-
+  
 } // namespace llvm

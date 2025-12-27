@@ -20,7 +20,10 @@
 #include <llvm/DebugInfo/CodeView/SymbolSerializer.h>
 #include <llvm/DebugInfo/CodeView/TypeIndexDiscovery.h>
 #include <llvm/DebugInfo/CodeView/TypeStreamMerger.h>
+#include <llvm/DebugInfo/CodeView/DebugLinesSubsection.h>
+#include <llvm/DebugInfo/CodeView/DebugChecksumsSubsection.h>
 #include <llvm/DebugInfo/MSF/MSFBuilder.h>
+#include <llvm/DebugInfo/MSF/MappedBlockStream.h>
 #include <llvm/DebugInfo/PDB/Native/DbiModuleDescriptorBuilder.h>
 #include <llvm/DebugInfo/PDB/Native/DbiStream.h>
 #include <llvm/DebugInfo/PDB/Native/DbiStreamBuilder.h>
@@ -31,6 +34,7 @@
 #include <llvm/DebugInfo/PDB/Native/ModuleDebugStream.h>
 #include <llvm/DebugInfo/PDB/Native/NativeSession.h>
 #include <llvm/DebugInfo/PDB/Native/PDBFileBuilder.h>
+#include <llvm/DebugInfo/PDB/Native/PDBFile.h>
 #include <llvm/DebugInfo/PDB/Native/PDBStringTableBuilder.h>
 #include <llvm/DebugInfo/PDB/Native/PublicsStream.h>
 #include <llvm/DebugInfo/PDB/Native/RawError.h>
@@ -49,6 +53,8 @@
 #include <llvm/Support/xxhash.h>
 #include <map>
 #include <windows.h>
+#include <llvm/ADT/StringExtras.h>
+#include <optional>
 
 #pragma warning(pop)
 
@@ -148,7 +154,8 @@ Error loadSectionHeaders(PDBFile &File, DbgHeaderType Type,
     return make_error<StringError>("Could not_ load the required stream data",
                                    inconvertibleErrorCode());
 
-  BinaryStreamReader Reader(*Stream);
+  BinaryStreamRef StreamRef(*Stream);
+  BinaryStreamReader Reader(StreamRef);
   uint32_t NumHeaders = Stream->getLength() / sizeof(object::coff_section);
   cantFail(Reader.readArray(Sections, NumHeaders));
   Buffer = ArrayRef<uint8_t>((uint8_t *)Sections.data(), Stream->getLength());
@@ -256,7 +263,7 @@ void addCommonLinkerModuleSymbols(StringRef PdbPath,
   EBS.Fields.push_back("exe");
   char buffer[MAX_PATH];
   GetModuleFileNameA(NULL, buffer, MAX_PATH);
-  SmallString<64> exe = buffer;
+  SmallString<64> exe{buffer};
   EBS.Fields.push_back(exe);
   EBS.Fields.push_back("pdb");
   EBS.Fields.push_back(PdbPath);
@@ -377,7 +384,10 @@ void writeTo(object::COFFObjectFile const &ObjFile,
     return;
   // Copy section contents from source object file to output file.
   ArrayRef<uint8_t> A;
-  ObjFile.getSectionContents(&Header, A);
+  if (auto Err = ObjFile.getSectionContents(&Header, A)) {
+    LLVM_JIT_PDB_LOG(Error, "Failed to get section contents");
+    return;
+  }
   if (!A.empty())
     memcpy(Buf /*+ OutputSectionOff*/, A.data(), A.size());
 
@@ -415,8 +425,14 @@ void readRelocTargets(object::COFFObjectFile const &ObjFile,
                       std::vector<object::COFFSymbolRef> &RelocTargets) {
   RelocTargets.reserve(Header.NumberOfRelocations);
   auto Relocs(ObjFile.getRelocations(&Header));
-  for (const object::coff_relocation &Rel : Relocs)
-    RelocTargets.push_back(*ObjFile.getSymbol(Rel.SymbolTableIndex));
+  for (const object::coff_relocation &Rel : Relocs) {
+    auto SymOrErr = ObjFile.getSymbol(Rel.SymbolTableIndex);
+    if (!SymOrErr) {
+      LLVM_JIT_PDB_LOG(Error, "Failed to get symbol for relocation");
+      continue;
+    }
+    RelocTargets.push_back(*SymOrErr);
+  }
 }
 // Allocate memory for a .debug$S / .debug$F section and_ relocate it.
 ArrayRef<uint8_t> relocateDebugChunk(object::COFFObjectFile const &ObjFile,
@@ -426,7 +442,7 @@ ArrayRef<uint8_t> relocateDebugChunk(object::COFFObjectFile const &ObjFile,
   std::vector<object::COFFSymbolRef> relocs;
   readRelocTargets(ObjFile, Header, relocs);
   writeTo(ObjFile, Header, Buffer, relocs);
-  return makeArrayRef(Buffer, Header.SizeOfRawData);
+  return ArrayRef<uint8_t>(Buffer, Header.SizeOfRawData);
 }
 
 pdb::SectionContrib createSectionContrib(object::COFFObjectFile const &ObjFile,
@@ -442,9 +458,12 @@ pdb::SectionContrib createSectionContrib(object::COFFObjectFile const &ObjFile,
   SC.Characteristics = Header->Characteristics;
   SC.Imod = Modi;
   ArrayRef<uint8_t> Contents;
-  ObjFile.getSectionContents(Header, Contents);
+  if (auto Err = ObjFile.getSectionContents(Header, Contents)) {
+    LLVM_JIT_PDB_LOG(Error, "Failed to get section contents for CRC calculation");
+    return SC;
+  }
   JamCRC CRC(0);
-  ArrayRef<uint8_t> CharContents = makeArrayRef(
+  ArrayRef<uint8_t> CharContents = ArrayRef<uint8_t>(
       reinterpret_cast<const uint8_t *>(Contents.data()), Contents.size());
   CRC.update(CharContents);
   SC.DataCrc = CRC.getCRC();
@@ -467,22 +486,33 @@ void InsertObjFileSectionHeaders(object::COFFObjectFile const &ObjFile,
   size_t sectionIndex = 0;
   size_t startVirtualAddress = LLVM_JIT_TEXT_SECTION_VIRTUAL_ADDRESS;
   for (const object::SectionRef &Section : ObjFile.sections()) {
-    StringRef SectionName;
-    if (auto E = Section.getName()) {
-      SectionName = *E;
-    } else
+    auto NameOrErr = Section.getName();
+    if (!NameOrErr) {
+      std::string ErrMsg = toString(NameOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to get section name: %s", ErrMsg.c_str());
       continue;
+    }
+    StringRef SectionName = *NameOrErr;
     auto sec = ObjFile.getCOFFSection(Section);
     if (".debug$S" == SectionName) {
       DebugSIndexSection = AllSections.size();
     } else if (".debug$T" == SectionName) {
       ArrayRef<uint8_t> Contents;
-      ObjFile.getSectionContents(sec, Contents);
+      if (auto Err = ObjFile.getSectionContents(sec, Contents)) {
+        LLVM_JIT_PDB_LOG(Error, "Failed to get .debug$T section contents");
+        continue;
+      }
       Contents = consumeDebugMagic(Contents, SectionName);
     } else {
       ArrayRef<uint8_t> Contents;
-      ObjFile.getSectionContents(sec, Contents);
+      if (auto Err = ObjFile.getSectionContents(sec, Contents)) {
+        LLVM_JIT_PDB_LOG(Error, "Failed to get section contents");
+        continue;
+      }
       AllSections.push_back(*sec);
+      // // 移除 COMDAT 特征标记，防止链接器合并重复的静态变量
+      // // 参考 Issue #1: COMDAT sections 会导致静态变量地址重定向问题
+      // AllSections.back().Characteristics &= ~( IMAGE_SCN_LNK_COMDAT | IMAGE_SCN_LNK_REMOVE);
       AllSections.back().VirtualAddress = startVirtualAddress; //
       AllSections.back().VirtualSize = AllSections.back().SizeOfRawData;
       startVirtualAddress += AllSections.back().SizeOfRawData;
@@ -775,7 +805,7 @@ bool mergeSymbolRecords(PDBFileBuilder &pdbBuilder,
   if (NeedsRealignment) {
     void *AlignedData =
         Allocator.Allocate(TotalRealignedSize, alignOf(CodeViewContainer::Pdb));
-    AlignedSymbolMem = makeMutableArrayRef(
+    AlignedSymbolMem = MutableArrayRef<uint8_t>(
         reinterpret_cast<uint8_t *>(AlignedData), TotalRealignedSize);
   }
 
@@ -792,7 +822,7 @@ bool mergeSymbolRecords(PDBFileBuilder &pdbBuilder,
         } else {
           // Otherwise, we can actually mutate the symbol directly, since we
           // copied it to apply relocations.
-          RecordBytes = makeMutableArrayRef(
+          RecordBytes = MutableArrayRef<uint8_t>(
               const_cast<uint8_t *>(Sym.data().data()), Sym.length());
         }
 
@@ -851,7 +881,7 @@ void MergeDebugT(ArrayRef<uint8_t> Data, CVIndexMap *ObjectIndexMap,
   if (Data.empty())
     return; // no debug info
 
-  BinaryByteStream Stream(Data, support::little);
+  BinaryByteStream Stream(Data, llvm::endianness::little);
   CVTypeArray Types;
   BinaryStreamReader Reader(Stream);
   bool ReadArrayOK = !Reader.readArray(Types, Reader.getLength());
@@ -862,7 +892,10 @@ void MergeDebugT(ArrayRef<uint8_t> Data, CVIndexMap *ObjectIndexMap,
   if (FirstType == Types.end())
     return;
 
-  Optional<uint32_t> PCHSign;
+  // LLVM 20: mergeTypeAndIdRecords no longer accepts std::optional<uint32_t>,
+  // it now expects std::optional<PCHMergerInfo>. Since we don't handle PCH,
+  // we simply don't pass this parameter (uses default std::nullopt).
+  std::optional<PCHMergerInfo> PCHSign;
   bool MergeTypeRecordOK = !mergeTypeAndIdRecords(
       IDTable, TypeTable, ObjectIndexMap->TPIMap, Types, PCHSign);
   (void)MergeTypeRecordOK;
@@ -872,7 +905,14 @@ void MergeDebugT(ArrayRef<uint8_t> Data, CVIndexMap *ObjectIndexMap,
 PublicSym32 createPublic(object::COFFObjectFile const &File,
                          object::COFFSymbolRef Sym) {
   PublicSym32 Pub(SymbolKind::S_PUB32);
-  Pub.Name = *File.getSymbolName(Sym);
+  auto NameOrErr = File.getSymbolName(Sym);
+  if (!NameOrErr) {
+    std::string ErrMsg = toString(NameOrErr.takeError());
+    LLVM_JIT_PDB_LOG(Error, "Failed to get symbol name: %s", ErrMsg.c_str());
+    Pub.Name = "<unknown>";
+  } else {
+    Pub.Name = *NameOrErr;
+  }
   if (Sym.isFunctionDefinition())
     Pub.Flags = PublicSymFlags::Function;
 
@@ -886,8 +926,11 @@ object::coff_section const *getSection(object::COFFObjectFile const &This,
   object::coff_section const *Result = nullptr;
   for (const object::SectionRef &Section : This.sections()) {
     auto NameOrErr = Section.getName();
-    if (!NameOrErr)
-      return nullptr;
+    if (!NameOrErr) {
+      std::string ErrMsg = toString(NameOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to get section name: %s", ErrMsg.c_str());
+      continue;
+    }
 
     if (*NameOrErr == SectionName) {
       Result = This.getCOFFSection(Section);
@@ -910,7 +953,12 @@ void InsertObjFileSections(
   size_t sectionIdx = 0;
 
   for (size_t i = 0; i < ObjFile.getNumberOfSymbols(); ++i) {
-    object::COFFSymbolRef Sym = *ObjFile.getSymbol(i);
+    auto SymOrErr = ObjFile.getSymbol(i);
+    if (!SymOrErr) {
+      LLVM_JIT_PDB_LOG(Error, "Failed to get symbol at index %zu", i);
+      continue;
+    }
+    object::COFFSymbolRef Sym = *SymOrErr;
     if (!Sym.isAnyUndefined())
       Publics.push_back(createPublic(ObjFile, Sym));
   }
@@ -920,37 +968,58 @@ void InsertObjFileSections(
   const object::coff_section *S = nullptr;
   if ((S = getSection(ObjFile, ".debug$T"))) {
     ArrayRef<uint8_t> Contents;
-    ObjFile.getSectionContents(S, Contents);
-    Contents = consumeDebugMagic(Contents, ".debug$T");
+    if (auto Err = ObjFile.getSectionContents(S, Contents)) {
+      LLVM_JIT_PDB_LOG(Error, "Failed to get .debug$T section contents");
+    } else {
+      Contents = consumeDebugMagic(Contents, ".debug$T");
 
-    MergeDebugT(Contents, &TypeIndexMap, IDTable, TypeTable);
+      MergeDebugT(Contents, &TypeIndexMap, IDTable, TypeTable);
+    }
   } else {
     DebugInfoMissing = true;
   }
   if ((S = getSection(ObjFile, ".debug$S"))) {
     ArrayRef<uint8_t> RelocatedDebugContents;
-    ObjFile.getSectionContents(S, RelocatedDebugContents);
-    RelocatedDebugContents = consumeDebugMagic(
-        relocateDebugChunk(ObjFile, Allocator, *S), ".debug$S");
+    if (auto Err = ObjFile.getSectionContents(S, RelocatedDebugContents)) {
+      LLVM_JIT_PDB_LOG(Error, "Failed to get .debug$S section contents");
+    }
+    else {
+      RelocatedDebugContents = consumeDebugMagic(
+          relocateDebugChunk(ObjFile, Allocator, *S), ".debug$S");
 
-    BinaryStreamReader Reader(RelocatedDebugContents, support::little);
-    Reader.readArray(Subsections, RelocatedDebugContents.size());
+      BinaryStreamReader Reader(RelocatedDebugContents, llvm::endianness::little);
+      if (auto Err = Reader.readArray(Subsections, RelocatedDebugContents.size())) {
+        std::string ErrMsg = toString(std::move(Err));
+        LLVM_JIT_PDB_LOG(Error, "Failed to read subsections: %s", ErrMsg.c_str());
+        return;
+      }
 
-    for (const DebugSubsectionRecord &SS : Subsections) {
+      for (const DebugSubsectionRecord &SS : Subsections) {
       switch (SS.kind()) {
       case DebugSubsectionKind::StringTable: {
-        CVStrTab.initialize(SS.getRecordData());
+        if (auto Err = CVStrTab.initialize(SS.getRecordData())) {
+          std::string ErrMsg = toString(std::move(Err));
+          LLVM_JIT_PDB_LOG(Error, "Failed to initialize string table: %s", ErrMsg.c_str());
+          break;
+        }
         break;
       }
       case DebugSubsectionKind::FileChecksums:
-        Checksums.initialize(SS.getRecordData());
+        if (auto Err = Checksums.initialize(SS.getRecordData())) {
+          std::string ErrMsg = toString(std::move(Err));
+          LLVM_JIT_PDB_LOG(Error, "Failed to initialize checksums: %s", ErrMsg.c_str());
+        }
         break;
       case DebugSubsectionKind::Lines: {
         // We can add the relocated line table directly to the PDB without
         // modification because the file checksum offsets will stay the same.
         DebugLinesSubsectionRef Lines;
         BinaryStreamReader reader(SS.getRecordData());
-        Lines.initialize(reader);
+        if (auto Err = Lines.initialize(reader)) {
+          std::string ErrMsg = toString(std::move(Err));
+          LLVM_JIT_PDB_LOG(Error, "Failed to initialize lines: %s", ErrMsg.c_str());
+          break;
+        }
         modBuilder.addDebugSubsection(SS);
         DebugLinesMissing = false;
         break;
@@ -963,7 +1032,11 @@ void InsertObjFileSections(
         // frame data subsections until we've processed the entire list of
         // subsections so that we can be sure we have the string table.
         DebugFrameDataSubsectionRef FDS;
-        FDS.initialize(SS.getRecordData());
+        if (auto Err = FDS.initialize(SS.getRecordData())) {
+          std::string ErrMsg = toString(std::move(Err));
+          LLVM_JIT_PDB_LOG(Error, "Failed to initialize frame data: %s", ErrMsg.c_str());
+          break;
+        }
         NewFpoFrames.push_back(std::move(FDS));
         break;
       }
@@ -981,12 +1054,23 @@ void InsertObjFileSections(
     }
     auto NewChecksums = std::make_unique<DebugChecksumsSubsection>(
         *StringsAndChecksum.strings());
-    for (FileChecksumEntry &FC : Checksums) {
-      StringRef Filename = *CVStrTab.getString(FC.FileNameOffset);
-      pdbBuilder.getDbiBuilder().addModuleSourceFile(modBuilder, Filename);
+    for (const FileChecksumEntry &FC : Checksums.getArray()) {
+      auto FilenameOrErr = CVStrTab.getString(FC.FileNameOffset);
+      if (!FilenameOrErr) {
+        std::string ErrMsg = toString(FilenameOrErr.takeError());
+        LLVM_JIT_PDB_LOG(Error, "Failed to get checksum filename: %s", ErrMsg.c_str());
+        continue;
+      }
+      StringRef Filename = *FilenameOrErr;
+      if (auto Err = pdbBuilder.getDbiBuilder().addModuleSourceFile(modBuilder, Filename)) {
+        std::string ErrMsg = toString(std::move(Err));
+        LLVM_JIT_PDB_LOG(Error, "Failed to add module source file: %s", ErrMsg.c_str());
+        continue;
+      }
       NewChecksums->addChecksum(Filename, FC.Kind, FC.Checksum);
     }
     modBuilder.addDebugSubsection(std::move(NewChecksums));
+    }
   } else {
     DebugInfoMissing = true;
   }
@@ -1008,16 +1092,21 @@ void InsertObjFileSections(
 
   if (S)
     for (const object::SectionRef &Section : ObjFile.sections()) {
-      if (auto SectionName = Section.getName()) {
-        if (".debug$S" == *SectionName || ".debug$T" == *SectionName)
-          continue;
-        auto sec = ObjFile.getCOFFSection(Section);
-        pdb::SectionContrib SC = createSectionContrib(
-            ObjFile, sec, ++sectionIdx, modBuilder.getModuleIndex());
-        pdbBuilder.getDbiBuilder().addSectionContrib(SC);
-        if (sectionIdx == 1)
-          modBuilder.setFirstSectionContrib(SC);
+      auto SectionNameOrErr = Section.getName();
+      if (!SectionNameOrErr) {
+        std::string ErrMsg = toString(SectionNameOrErr.takeError());
+        LLVM_JIT_PDB_LOG(Error, "Failed to get section name: %s", ErrMsg.c_str());
+        continue;
       }
+      auto SectionName = *SectionNameOrErr;
+      if (".debug$S" == SectionName || ".debug$T" == SectionName)
+        continue;
+      auto sec = ObjFile.getCOFFSection(Section);
+      pdb::SectionContrib SC = createSectionContrib(
+          ObjFile, sec, ++sectionIdx, modBuilder.getModuleIndex());
+      pdbBuilder.getDbiBuilder().addSectionContrib(SC);
+      if (sectionIdx == 1)
+        modBuilder.setFirstSectionContrib(SC);
     }
 }
 
@@ -1028,8 +1117,11 @@ void addTypeInfo(pdb::TpiStreamBuilder &TpiBuilder, TypeCollection &TypeTable) {
   // Flatten the in memory type table and_ hash each type.
   TypeTable.ForEachRecord([&](TypeIndex TI, const CVType &Type) {
     auto Hash = pdb::hashTypeRecord(Type);
-    if (auto E = Hash.takeError())
-      printf("type hashing error");
+    if (!Hash) {
+      std::string ErrMsg = toString(Hash.takeError());
+      LLVM_JIT_PDB_LOG(Error, "type hashing error: %s", ErrMsg.c_str());
+      return;
+    }
     TpiBuilder.addTypeRecord(Type.RecordData, *Hash);
   });
 }
@@ -1078,15 +1170,35 @@ bool JITPDBFileBuilder::EmitPDBImpl(StringRef PdbPath, codeview::GUID PdbGuid,
   std::vector<DebugFrameDataSubsectionRef> NewFpoFrames;
   std::vector<ulittle32_t *> StringTableReferences;
   DebugSubsectionArray Subsections;
-  pdbBuilder.initialize(File.getBlockSize());
-  for (uint32_t I = 0; I < kSpecialStreamCount; ++I)
-    pdbBuilder.getMsfBuilder().addStream(0);
+  
+  // Check the Error returned by initialize
+  if (auto Err = pdbBuilder.initialize(File.getBlockSize())) {
+    std::string ErrMsg = toString(std::move(Err));
+    LLVM_JIT_PDB_LOG(Error, "Failed to initialize PDB builder: %s", ErrMsg.c_str());
+    return false;
+  }
+  
+  // Add special streams and check for errors
+  for (uint32_t I = 0; I < kSpecialStreamCount; ++I) {
+    auto StreamIdOrErr = pdbBuilder.getMsfBuilder().addStream(0);
+    if (!StreamIdOrErr) {
+      std::string ErrMsg = toString(StreamIdOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to add stream: %s", ErrMsg.c_str());
+      return false;
+    }
+  }
 
   StringsAndChecksum.setStrings(std::make_shared<DebugStringTableSubsection>());
 
-  if (File.hasPDBDbiStream() && File.getPDBDbiStream()) {
+  if (File.hasPDBDbiStream()) {
+    auto DbiStreamOrErr = File.getPDBDbiStream();
+    if (!DbiStreamOrErr) {
+      std::string ErrMsg = toString(DbiStreamOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to get DBI stream: %s", ErrMsg.c_str());
+      return false;
+    }
     DbiStreamBuilder &builder = pdbBuilder.getDbiBuilder();
-    DbiStream &stream = *File.getPDBDbiStream();
+    DbiStream &stream = *DbiStreamOrErr;
     builder.setAge(stream.getAge());
     builder.setBuildNumber(stream.getBuildNumber());
     builder.setFlags(stream.getFlags());
@@ -1104,8 +1216,13 @@ bool JITPDBFileBuilder::EmitPDBImpl(StringRef PdbPath, codeview::GUID PdbGuid,
     builder.setVersionHeader(stream.getDbiVersion());
 
 #ifdef PATCH_OBJ
-    DbiModuleDescriptorBuilder &modBuilder =
-        *builder.addModuleInfo("LLVMJITPDB");
+    auto ModBuilderOrErr = builder.addModuleInfo("LLVMJITPDB");
+    if (!ModBuilderOrErr) {
+      std::string ErrMsg = toString(ModBuilderOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to add module info for LLVMJITPDB: %s", ErrMsg.c_str());
+      return false;
+    }
+    DbiModuleDescriptorBuilder &modBuilder = *ModBuilderOrErr;
     modBuilder.setObjFileName("");
 
     char maxPath[260];
@@ -1153,20 +1270,37 @@ bool JITPDBFileBuilder::EmitPDBImpl(StringRef PdbPath, codeview::GUID PdbGuid,
                           AllSections.size() * sizeof(object::coff_section));
 
     builder.createSectionMap(AllSections);
-    builder.addDbgStream(DbgHeaderType::SectionHdr, AllSectionHeaderData);
+    if (auto Err = builder.addDbgStream(DbgHeaderType::SectionHdr, AllSectionHeaderData)) {
+      std::string ErrMsg = toString(std::move(Err));
+      LLVM_JIT_PDB_LOG(Error, "Failed to addDbgStream: %s", ErrMsg.c_str());
+      return false;
+    }
+    
 #endif
     // * LINKER * special
     // It's not_ entirely clear what this is, but the * Linker * module uses it.
     uint32_t PdbFilePathNI = builder.addECName(PdbPathStr.c_str());
-    auto &LinkerModule = *builder.addModuleInfo("* Linker *");
+    auto LinkerModuleOrErr = builder.addModuleInfo("* Linker *");
+    if (!LinkerModuleOrErr) {
+      std::string ErrMsg = toString(LinkerModuleOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to add module info for Linker: %s", ErrMsg.c_str());
+      return false;
+    }
+    auto &LinkerModule = *LinkerModuleOrErr;
     LinkerModule.setPdbFilePathNI(PdbFilePathNI);
     addCommonLinkerModuleSymbols(PdbPathStr, LinkerModule, Allocator);
     addLinkerModuleSectionSymbol(modBuilder, Allocator, AllSections.size());
   }
 
-  if (File.hasPDBInfoStream() && File.getPDBInfoStream()) {
+  if (File.hasPDBInfoStream()) {
+    auto InfoStreamOrErr = File.getPDBInfoStream();
+    if (!InfoStreamOrErr) {
+      std::string ErrMsg = toString(InfoStreamOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to get Info stream: %s", ErrMsg.c_str());
+      return false;
+    }
     InfoStreamBuilder &builder = pdbBuilder.getInfoBuilder();
-    InfoStream &stream = *File.getPDBInfoStream();
+    InfoStream &stream = *InfoStreamOrErr;
     for (auto sig : stream.getFeatureSignatures())
       builder.addFeature(sig);
     builder.setAge(stream.getAge());
@@ -1174,15 +1308,27 @@ bool JITPDBFileBuilder::EmitPDBImpl(StringRef PdbPath, codeview::GUID PdbGuid,
     builder.setSignature(stream.getSignature());
     builder.setVersion(stream.getVersion());
   }
-  if (File.hasPDBIpiStream() && File.getPDBIpiStream()) {
+  if (File.hasPDBIpiStream()) {
+    auto IpiStreamOrErr = File.getPDBIpiStream();
+    if (!IpiStreamOrErr) {
+      std::string ErrMsg = toString(IpiStreamOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to get IPI stream: %s", ErrMsg.c_str());
+      return false;
+    }
     TpiStreamBuilder &builder = pdbBuilder.getIpiBuilder();
-    TpiStream &stream = *File.getPDBIpiStream();
+    TpiStream &stream = *IpiStreamOrErr;
 
     builder.setVersionHeader(stream.getTpiVersion());
   }
-  if (File.hasPDBTpiStream() && File.getPDBTpiStream()) {
+  if (File.hasPDBTpiStream()) {
+    auto TpiStreamOrErr = File.getPDBTpiStream();
+    if (!TpiStreamOrErr) {
+      std::string ErrMsg = toString(TpiStreamOrErr.takeError());
+      LLVM_JIT_PDB_LOG(Error, "Failed to get TPI stream: %s", ErrMsg.c_str());
+      return false;
+    }
     TpiStreamBuilder &builder = pdbBuilder.getTpiBuilder();
-    TpiStream &stream = *File.getPDBTpiStream();
+    TpiStream &stream = *TpiStreamOrErr;
 
     builder.setVersionHeader(stream.getTpiVersion());
   }
@@ -1206,12 +1352,13 @@ bool JITPDBFileBuilder::EmitPDBImpl(StringRef PdbPath, codeview::GUID PdbGuid,
                                  std::move(NatvisNameBuffer.second));
 
   codeview::GUID guid;
-  if (!pdbBuilder.commit(PdbPathStr.c_str(),
-                         &guid)) // write final pdb to <name>.pdb.tmp
-  {
-    return true;
+  auto CommitErr = pdbBuilder.commit(PdbPathStr.c_str(), &guid);
+  if (CommitErr) {
+    std::string ErrMsg = toString(std::move(CommitErr));
+    LLVM_JIT_PDB_LOG(Error, "Failed to commit PDB: %s", ErrMsg.c_str());
+    return false;
   }
-  return false;
+  return true;
 }
 bool JITPDBFileBuilder::commit(StringRef PdbPath, codeview::GUID Guid,
                                object::COFFObjectFile const &ObjFile,
