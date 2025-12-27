@@ -236,18 +236,22 @@ void JITPDBMemoryManager::createDll() {
 #define LLVM_JIT_PDB_STRING_AS_PRINTF_ARG(str) int(str.size()), str.data()
 
 void JITPDBMemoryManager::reloadDll() {
+  size_t codeUsed = CodeSection.cur - CodeSection.mem.addr;
+  size_t dataRWUsed = DataRWSection.cur - DataRWSection.mem.addr;
+  size_t dataRUsed = DataRSection.cur - DataRSection.mem.addr;
+  
   LLVM_JIT_PDB_LOG(Information,
                    "\n\t%.*s Jit Status\n"
-                   "\t\t-Code memory usage : %d%%\n"
-                   "\t\t-DataRW memory usage : %d%%\n"
-                   "\t\t-DataRO memory usage : %d%%\n",
+                   "\t\t-Code memory: %zu bytes used / %zu total (%.2f%%)\n"
+                   "\t\t-DataRW memory: %zu bytes used / %zu total (%.2f%%)\n"
+                   "\t\t-DataRO memory: %zu bytes used / %zu total (%.2f%%)\n",
                    LLVM_JIT_PDB_STRING_AS_PRINTF_ARG(DllPath),
-                   int(100 * (CodeSection.cur - CodeSection.mem.addr) /
-                       CodeSection.mem.size),
-                   int(100 * (DataRWSection.cur - DataRWSection.mem.addr) /
-                       DataRWSection.mem.size),
-                   int(100 * (DataRSection.cur - DataRSection.mem.addr) /
-                       DataRSection.mem.size));
+                   codeUsed, CodeSection.mem.size,
+                   100.0 * codeUsed / CodeSection.mem.size,
+                   dataRWUsed, DataRWSection.mem.size,
+                   100.0 * dataRWUsed / DataRWSection.mem.size,
+                   dataRUsed, DataRSection.mem.size,
+                   100.0 * dataRUsed / DataRSection.mem.size);
 
   uint8_t *backupMem = (uint8_t *)::malloc(MemorySize);
 
