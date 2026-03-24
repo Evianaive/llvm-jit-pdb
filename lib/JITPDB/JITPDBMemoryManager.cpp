@@ -11,6 +11,8 @@
 #include <llvm/Support/FileSystem.h>
 #pragma warning(pop)
 #include <windows.h>
+#include <algorithm>
+#include <vector>
 
 namespace {
 enum class LogKind { Information, Warning, Error };
@@ -46,6 +48,8 @@ struct UNWIND_INFO {
 namespace llvm {
 namespace {
 const char *SectionNames[4] = {".text", ".rdata", ".pdata", ".xdata"};
+constexpr size_t DefaultEmbeddedCodeCapacity = 64 * 1024;
+constexpr size_t DefaultEmbeddedDataCapacity = 64 * 1024;
 
 int acquireCryptHandle(HCRYPTPROV &handle) {
   if (::CryptAcquireContextW(&handle, 0, 0, PROV_RSA_FULL,
@@ -132,6 +136,13 @@ std::string guidToStr(codeview::GUID const &guid) {
 JITPDBMemoryManager::JITPDBMemoryManager(
     StringRef PdbOutputPath, StringRef PdbTemplatePath,
     std::function<void(void *)> NotifyModuleEmittedCB)
+    : JITPDBMemoryManager(PdbOutputPath, PdbTemplatePath,
+                          NotifyModuleEmittedCB, 0, 0) {}
+
+JITPDBMemoryManager::JITPDBMemoryManager(
+    StringRef PdbOutputPath, StringRef PdbTemplatePath,
+    std::function<void(void *)> NotifyModuleEmittedCB,
+    size_t RequestedCodeSize, size_t RequestedDataSize)
     : PdbPath(PdbOutputPath), NotifyModuleEmitted(NotifyModuleEmittedCB),
       PdbTplPath(PdbTemplatePath) {
   // auto& NextGUID = getNextBuildGuid();
@@ -160,6 +171,11 @@ JITPDBMemoryManager::JITPDBMemoryManager(
 
   if (PdbTplPath.empty()) {
     memcpy(&DllHackInfoData, JITPDB_HCK, sizeof(DllHackInfo));
+    if (RequestedCodeSize == 0 && RequestedDataSize == 0) {
+      RequestedCodeSize = DefaultEmbeddedCodeCapacity;
+      RequestedDataSize = DefaultEmbeddedDataCapacity;
+    }
+    buildRuntimeTemplateFromEmbedded(RequestedCodeSize, RequestedDataSize);
   } else {
     DllTplPath = PdbTplPath.substr(0, PdbTplPath.find_last_of('.'));
     DllTplPath += ".dll";
@@ -211,7 +227,12 @@ void JITPDBMemoryManager::createDll() {
 #pragma warning(pop)
     {
       if (DllTplPath.empty()) {
-        fwrite(JITPDB_DLL, JITPDB_DLL_SIZE, 1, DllFile);
+        if (RuntimeDllTemplateData.empty()) {
+          fwrite(JITPDB_DLL, JITPDB_DLL_SIZE, 1, DllFile);
+        } else {
+          fwrite(RuntimeDllTemplateData.data(), 1, RuntimeDllTemplateData.size(),
+                 DllFile);
+        }
       } else {
         FILE *DllTplFile = fopen(DllTplPath.c_str(), "rb");
         if (DllTplFile == nullptr) {
@@ -231,6 +252,140 @@ void JITPDBMemoryManager::createDll() {
       break;
     }
   }
+}
+
+bool JITPDBMemoryManager::buildRuntimeTemplateFromEmbedded(
+    size_t RequestedCodeSize, size_t RequestedDataSize) {
+  auto ReadU16 = [](const std::vector<char> &Data, size_t Offset) -> uint16_t {
+    uint16_t Value = 0;
+    memcpy(&Value, Data.data() + Offset, sizeof(Value));
+    return Value;
+  };
+  auto ReadU32 = [](const std::vector<char> &Data, size_t Offset) -> uint32_t {
+    uint32_t Value = 0;
+    memcpy(&Value, Data.data() + Offset, sizeof(Value));
+    return Value;
+  };
+  auto WriteU32 = [](std::vector<char> &Data, size_t Offset, uint32_t Value) {
+    memcpy(Data.data() + Offset, &Value, sizeof(Value));
+  };
+  auto AlignUp = [](uint32_t Value, uint32_t Align) -> uint32_t {
+    if (Align == 0)
+      return Value;
+    return (Value + Align - 1) / Align * Align;
+  };
+
+  RuntimeDllTemplateData.assign(JITPDB_DLL, JITPDB_DLL + JITPDB_DLL_SIZE);
+  RuntimeHckTemplateData.assign(JITPDB_HCK, JITPDB_HCK + sizeof(DllHackInfo));
+  DllHackInfo RuntimeHackInfo;
+  memcpy(&RuntimeHackInfo, RuntimeHckTemplateData.data(), sizeof(RuntimeHackInfo));
+
+  const uint32_t PeOffset = ReadU32(RuntimeDllTemplateData, 0x3C);
+  const uint32_t CoffOffset = PeOffset + 4;
+  const uint32_t OptionalOffset = CoffOffset + 20;
+  const uint16_t OptionalMagic = ReadU16(RuntimeDllTemplateData, OptionalOffset);
+  const uint32_t DataDirRelOffset = OptionalMagic == 0x20B ? 112 : 96;
+
+  const uint32_t SectionAlignment = ReadU32(RuntimeDllTemplateData, OptionalOffset + 32);
+  const uint32_t FileAlignment = ReadU32(RuntimeDllTemplateData, OptionalOffset + 36);
+  const uint32_t DataDirOffset = OptionalOffset + DataDirRelOffset;
+  const uint32_t DataDirCount =
+      ReadU32(RuntimeDllTemplateData, DataDirOffset - sizeof(uint32_t));
+
+  const auto &TextInfo = RuntimeHackInfo.SectionInfos[DllHackInfo::TEXT];
+  const uint32_t OldTextFilePos = TextInfo.FilePos;
+  const uint32_t OldTextRawSize = TextInfo.Size;
+  const uint32_t TextHeaderPos = TextInfo.HeaderPos;
+  const uint32_t OldTextVirtualAddress = TextInfo.VirtualAddress;
+  const uint32_t OldTextVirtualSize = ReadU32(RuntimeDllTemplateData, TextHeaderPos + 8);
+
+  uint64_t RequestedText64 = RequestedCodeSize + RequestedDataSize;
+  if (RequestedText64 > UINT32_MAX) {
+    LLVM_JIT_PDB_LOG(Error, "requested template size too large: %llu",
+                     (unsigned long long)RequestedText64);
+    return false;
+  }
+
+  const uint32_t OldTextVASpan = AlignUp(OldTextVirtualSize, SectionAlignment);
+  const uint32_t RequestedText =
+      std::max<uint32_t>(static_cast<uint32_t>(RequestedText64), FileAlignment);
+  const uint32_t NewTextVirtualSize = AlignUp(RequestedText, SectionAlignment);
+  const uint32_t NewTextRawSize = AlignUp(NewTextVirtualSize, FileAlignment);
+  const uint32_t NewTextVASpan = AlignUp(NewTextVirtualSize, SectionAlignment);
+
+  const int32_t DeltaRaw = static_cast<int32_t>(NewTextRawSize) -
+                           static_cast<int32_t>(OldTextRawSize);
+  const int32_t DeltaVA = static_cast<int32_t>(NewTextVASpan) -
+                          static_cast<int32_t>(OldTextVASpan);
+  const size_t TextRawEnd = static_cast<size_t>(OldTextFilePos + OldTextRawSize);
+
+  if (DeltaRaw > 0) {
+    RuntimeDllTemplateData.insert(RuntimeDllTemplateData.begin() + TextRawEnd,
+                                  DeltaRaw, 0);
+  } else if (DeltaRaw < 0) {
+    RuntimeDllTemplateData.erase(RuntimeDllTemplateData.begin() + TextRawEnd +
+                                     DeltaRaw,
+                                 RuntimeDllTemplateData.begin() + TextRawEnd);
+  }
+
+  // TEXT section fields.
+  WriteU32(RuntimeDllTemplateData, TextHeaderPos + 8, NewTextVirtualSize);
+  WriteU32(RuntimeDllTemplateData, TextHeaderPos + 16, NewTextRawSize);
+  RuntimeHackInfo.SectionInfos[DllHackInfo::TEXT].Size = NewTextRawSize;
+
+  // Shift the following sections.
+  for (int I = DllHackInfo::RDATA; I < DllHackInfo::SECTION_COUNT; ++I) {
+    auto &Info = RuntimeHackInfo.SectionInfos[I];
+    Info.VirtualAddress = std::max(0, Info.VirtualAddress + DeltaVA);
+    Info.FilePos = std::max(0, Info.FilePos + DeltaRaw);
+    WriteU32(RuntimeDllTemplateData, Info.HeaderPos + 12, Info.VirtualAddress);
+    WriteU32(RuntimeDllTemplateData, Info.HeaderPos + 20, Info.FilePos);
+  }
+
+  // Keep .text section executable/readable/writable.
+  uint32_t TextCharacteristics = ReadU32(RuntimeDllTemplateData, TextHeaderPos + 36);
+  TextCharacteristics |= 0x80000000u; // IMAGE_SCN_MEM_WRITE
+  TextCharacteristics |= 0x40000000u; // IMAGE_SCN_MEM_READ
+  TextCharacteristics |= 0x20000000u; // IMAGE_SCN_MEM_EXECUTE
+  WriteU32(RuntimeDllTemplateData, TextHeaderPos + 36, TextCharacteristics);
+
+  // OptionalHeader updates.
+  WriteU32(RuntimeDllTemplateData, OptionalOffset + 4, NewTextRawSize);
+  uint32_t SizeOfInitializedData = 0;
+  for (int I = DllHackInfo::RDATA; I < DllHackInfo::SECTION_COUNT; ++I)
+    SizeOfInitializedData += RuntimeHackInfo.SectionInfos[I].Size;
+  WriteU32(RuntimeDllTemplateData, OptionalOffset + 8, SizeOfInitializedData);
+
+  uint32_t LastEnd = 0;
+  for (int I = 0; I < DllHackInfo::SECTION_COUNT; ++I) {
+    const auto &Info = RuntimeHackInfo.SectionInfos[I];
+    const uint32_t VirtualSize = ReadU32(RuntimeDllTemplateData, Info.HeaderPos + 8);
+    LastEnd = std::max(LastEnd, AlignUp(Info.VirtualAddress + VirtualSize, SectionAlignment));
+  }
+  WriteU32(RuntimeDllTemplateData, OptionalOffset + 56, LastEnd);
+
+  // Shift any data directory RVA that points after the old .text span.
+  for (uint32_t I = 0; I < DataDirCount; ++I) {
+    const uint32_t EntryOffset = DataDirOffset + I * 8;
+    uint32_t Rva = ReadU32(RuntimeDllTemplateData, EntryOffset);
+    if (!Rva)
+      continue;
+    if (Rva >= OldTextVirtualAddress + OldTextVASpan) {
+      Rva = static_cast<uint32_t>(std::max(0, static_cast<int32_t>(Rva) + DeltaVA));
+      WriteU32(RuntimeDllTemplateData, EntryOffset, Rva);
+    }
+  }
+
+  // Update absolute file positions in HCK if located after .text raw end.
+  if (RuntimeHackInfo.PdbGuidPos > static_cast<int>(TextRawEnd))
+    RuntimeHackInfo.PdbGuidPos = std::max(0, RuntimeHackInfo.PdbGuidPos + DeltaRaw);
+  if (RuntimeHackInfo.PdbFileNamePos > static_cast<int>(TextRawEnd))
+    RuntimeHackInfo.PdbFileNamePos =
+        std::max(0, RuntimeHackInfo.PdbFileNamePos + DeltaRaw);
+
+  memcpy(RuntimeHckTemplateData.data(), &RuntimeHackInfo, sizeof(RuntimeHackInfo));
+  memcpy(&DllHackInfoData, RuntimeHckTemplateData.data(), sizeof(DllHackInfoData));
+  return true;
 }
 
 #define LLVM_JIT_PDB_STRING_AS_PRINTF_ARG(str) int(str.size()), str.data()
