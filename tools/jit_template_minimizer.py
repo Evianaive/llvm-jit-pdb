@@ -92,7 +92,7 @@ def find_sec(pe: PE, name: bytes) -> Sec:
     raise ValueError(f"missing section {name!r}")
 
 
-def resize_text(pe: PE, code_size: int, data_size: int) -> None:
+def resize_text(pe: PE, code_size: int, data_size: int) -> Tuple[int, int, int]:
     text = find_sec(pe, b".text")
     old_raw = text.raw
     old_span = align_up(text.vsz, pe.sec_align)
@@ -139,6 +139,7 @@ def resize_text(pe: PE, code_size: int, data_size: int) -> None:
     for s in pe.secs:
         last = max(last, align_up(s.va + s.vsz, pe.sec_align))
     w32(pe.buf, pe.opt + 56, last)     # SizeOfImage
+    return d_raw, d_va, text_end
 
 
 def find_rsds_file_offsets(pe: PE) -> Tuple[int, int]:
@@ -164,6 +165,37 @@ def find_rsds_file_offsets(pe: PE) -> Tuple[int, int]:
         if typ == 2 and sz >= 24 and pe.buf[ptr:ptr+4] == b"RSDS":
             return ptr + 4, ptr + 24
     raise ValueError("RSDS not found")
+
+
+def read_hck_guid_name_offsets(hck_bytes: bytes) -> Tuple[int, int]:
+    # DllHackInfo in this project is 23 int32 => 92 bytes.
+    if len(hck_bytes) < 92:
+        raise ValueError("invalid hck size")
+    pdb_name = struct.unpack_from("<i", hck_bytes, 84)[0]
+    pdb_guid = struct.unpack_from("<i", hck_bytes, 88)[0]
+    return pdb_guid, pdb_name
+
+
+def patch_hck_from_input(hck_bytes: bytes, d_raw: int, d_va: int, text_end: int, new_text_raw: int) -> bytes:
+    if len(hck_bytes) < 92:
+        raise ValueError("invalid hck size")
+    ints = list(struct.unpack("<23i", hck_bytes[:92]))
+    # section infos start at int[4], each section has 4 ints: hdr, va, size, file
+    # TEXT section size
+    ints[4 + 2] = new_text_raw
+    # sections after TEXT
+    for sec_i in (1, 2, 3):
+        base = 4 + sec_i * 4
+        ints[base + 1] += d_va
+        ints[base + 3] += d_raw
+    # final fields: timestamp, pdbName, pdbGuid
+    pdb_name_idx = 21
+    pdb_guid_idx = 22
+    if ints[pdb_name_idx] > text_end:
+        ints[pdb_name_idx] += d_raw
+    if ints[pdb_guid_idx] > text_end:
+        ints[pdb_guid_idx] += d_raw
+    return struct.pack("<23i", *ints)
 
 
 def build_hck(pe: PE, guid_pos: int, pdb_name_pos: int) -> bytes:
@@ -272,15 +304,32 @@ def main() -> int:
     ap.add_argument("--dll", required=True)
     ap.add_argument("--pdb", required=True)
     ap.add_argument("--out-prefix", required=True)
+    ap.add_argument("--hck", help="optional input hck for RSDS fallback")
     ap.add_argument("--code-size", type=int, required=True)
     ap.add_argument("--data-size", type=int, required=True)
     ap.add_argument("--emit-cpp", action="store_true")
     args = ap.parse_args()
 
     pe = parse_pe(pathlib.Path(args.dll).read_bytes())
-    resize_text(pe, args.code_size, args.data_size)
-    guid_pos, pdb_name_pos = find_rsds_file_offsets(pe)
-    hck = build_hck(pe, guid_pos, pdb_name_pos)
+    d_raw, d_va, text_end = resize_text(pe, args.code_size, args.data_size)
+    text_sec = find_sec(pe, b".text")
+    try:
+        guid_pos, pdb_name_pos = find_rsds_file_offsets(pe)
+    except Exception:
+        if not args.hck:
+            raise
+        hck_in = pathlib.Path(args.hck).read_bytes()
+        guid_pos, pdb_name_pos = read_hck_guid_name_offsets(hck_in)
+        if guid_pos > text_end:
+            guid_pos += d_raw
+        if pdb_name_pos > text_end:
+            pdb_name_pos += d_raw
+    if args.hck:
+        hck_in = pathlib.Path(args.hck).read_bytes()
+        hck = patch_hck_from_input(hck_in, d_raw=d_raw, d_va=d_va,
+                                   text_end=text_end, new_text_raw=text_sec.raw)
+    else:
+        hck = build_hck(pe, guid_pos, pdb_name_pos)
 
     pdb_raw = pathlib.Path(args.pdb).read_bytes()
     pdb_trim = trim_pdb_msf_logical_size(pdb_raw)

@@ -63,6 +63,7 @@ JITPDBMemoryManager(StringRef PdbOutputPath,
 python3 tools/jit_template_minimizer.py \
   --dll jitmem.dll \
   --pdb jitmem.pdb \
+  --hck jitmem.hck \
   --out-prefix out/jitmem_8k \
   --code-size $((4*1024)) \
   --data-size $((4*1024)) \
