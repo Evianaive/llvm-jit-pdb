@@ -295,8 +295,17 @@ PDBFile *LoadCppEmbeddedPDB(std::unique_ptr<IPDBSession> &Session,
                             StringRef PdbTplPath) {
 
   if (PdbTplPath.empty()) {
-    auto buffer = MemoryBuffer::getMemBuffer(
-        StringRef(JITPDB_PDB, JITPDB_PDB_SIZE), "", false);
+    StringRef EmbeddedPDB(JITPDB_PDB, JITPDB_PDB_SIZE);
+    if (JITPDB_PDB_SIZE >= 56) {
+      uint32_t BlockSize = 0;
+      uint32_t NumBlocks = 0;
+      memcpy(&BlockSize, JITPDB_PDB + 32, sizeof(uint32_t));
+      memcpy(&NumBlocks, JITPDB_PDB + 40, sizeof(uint32_t));
+      uint64_t LogicalSize = uint64_t(BlockSize) * uint64_t(NumBlocks);
+      if (BlockSize && NumBlocks && LogicalSize <= JITPDB_PDB_SIZE)
+        EmbeddedPDB = EmbeddedPDB.slice(0, size_t(LogicalSize));
+    }
+    auto buffer = MemoryBuffer::getMemBuffer(EmbeddedPDB, "", false);
     if (auto E = pdb::NativeSession::createFromPdb(std::move(buffer), Session))
       return nullptr;
   } else {

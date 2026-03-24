@@ -48,8 +48,42 @@ struct UNWIND_INFO {
 namespace llvm {
 namespace {
 const char *SectionNames[4] = {".text", ".rdata", ".pdata", ".xdata"};
-constexpr size_t DefaultEmbeddedCodeCapacity = 64 * 1024;
-constexpr size_t DefaultEmbeddedDataCapacity = 64 * 1024;
+uint32_t alignUpU32(uint32_t Value, uint32_t Align) {
+  if (Align == 0)
+    return Value;
+  return (Value + Align - 1) / Align * Align;
+}
+
+size_t computeDefaultEmbeddedTextSize() {
+  auto ReadU16 = [](const char *Data, size_t Offset) -> uint16_t {
+    uint16_t Value = 0;
+    memcpy(&Value, Data + Offset, sizeof(Value));
+    return Value;
+  };
+  auto ReadU32 = [](const char *Data, size_t Offset) -> uint32_t {
+    uint32_t Value = 0;
+    memcpy(&Value, Data + Offset, sizeof(Value));
+    return Value;
+  };
+
+  const uint32_t PeOffset = ReadU32(JITPDB_DLL, 0x3C);
+  const uint32_t OptionalOffset = PeOffset + 4 + 20;
+  const uint16_t OptionalMagic = ReadU16(JITPDB_DLL, OptionalOffset);
+  (void)OptionalMagic;
+
+  const uint32_t SectionAlignment = ReadU32(JITPDB_DLL, OptionalOffset + 32);
+  const uint32_t FileAlignment = ReadU32(JITPDB_DLL, OptionalOffset + 36);
+
+  // Minimum viable layout:
+  // - Total memory must keep Code/RData/RWData split (1/2, 1/4, 1/4).
+  // - CodeSection.mem.size must satisfy %128 == 0.
+  // => text size must be divisible by 256.
+  const uint32_t MinByLayout = 8 * 1024;
+  uint32_t MinText = MinByLayout;
+  MinText = alignUpU32(MinText, std::max<uint32_t>(1, FileAlignment));
+  MinText = alignUpU32(MinText, std::max<uint32_t>(1, SectionAlignment));
+  return MinText;
+}
 
 int acquireCryptHandle(HCRYPTPROV &handle) {
   if (::CryptAcquireContextW(&handle, 0, 0, PROV_RSA_FULL,
@@ -172,8 +206,9 @@ JITPDBMemoryManager::JITPDBMemoryManager(
   if (PdbTplPath.empty()) {
     memcpy(&DllHackInfoData, JITPDB_HCK, sizeof(DllHackInfo));
     if (RequestedCodeSize == 0 && RequestedDataSize == 0) {
-      RequestedCodeSize = DefaultEmbeddedCodeCapacity;
-      RequestedDataSize = DefaultEmbeddedDataCapacity;
+      size_t MinText = computeDefaultEmbeddedTextSize();
+      RequestedCodeSize = MinText / 2;
+      RequestedDataSize = MinText / 2;
     }
     buildRuntimeTemplateFromEmbedded(RequestedCodeSize, RequestedDataSize);
   } else {
@@ -270,9 +305,7 @@ bool JITPDBMemoryManager::buildRuntimeTemplateFromEmbedded(
     memcpy(Data.data() + Offset, &Value, sizeof(Value));
   };
   auto AlignUp = [](uint32_t Value, uint32_t Align) -> uint32_t {
-    if (Align == 0)
-      return Value;
-    return (Value + Align - 1) / Align * Align;
+    return alignUpU32(Value, Align);
   };
 
   RuntimeDllTemplateData.assign(JITPDB_DLL, JITPDB_DLL + JITPDB_DLL_SIZE);
