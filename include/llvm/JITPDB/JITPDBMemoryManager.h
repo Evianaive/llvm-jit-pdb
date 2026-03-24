@@ -11,6 +11,7 @@
 #include <llvm/ExecutionEngine/RTDyldMemoryManager.h>
 #pragma warning(pop)
 #include "JITPDBFileBuilder.h"
+#include <vector>
 
 namespace llvm {
 class JITPDBMemoryManager : public RTDyldMemoryManager {
@@ -29,6 +30,9 @@ public:
   JITPDBMemoryManager(StringRef PdbOutputPath, StringRef DllTemplatePath = StringRef(),
                       std::function<void(void *)> NotifyModuleEmittedCB =
                           std::function<void(void *)>());
+  JITPDBMemoryManager(StringRef PdbOutputPath, StringRef DllTemplatePath,
+                      std::function<void(void *)> NotifyModuleEmittedCB,
+                      size_t RequestedCodeSize, size_t RequestedDataSize);
   ~JITPDBMemoryManager();
 
   codeview::GUID const &getGuid() const { return Guid; }
@@ -68,6 +72,8 @@ private:
   void loadDll();
   void reloadDll();
   void unloadDll();
+  bool buildRuntimeTemplateFromEmbedded(size_t RequestedCodeSize,
+                                        size_t RequestedDataSize);
 
 private:
   struct Section {
@@ -116,6 +122,8 @@ private:
   std::string PdbTplPath;
   std::string DllTplPath;
   std::function<void(void*)> NotifyModuleEmitted;
+  std::vector<char> RuntimeDllTemplateData;
+  std::vector<char> RuntimeHckTemplateData;
   Status StatusValue = Status::Allocating;
   bool Verbose = false;
   bool PDBDontEmit = false;
