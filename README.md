@@ -58,6 +58,9 @@ Finally, you can check both the JITPDBMemoryManager::Status and console output f
 ### I reach the memory code/data size limitation, what can I do ?
 A new tool called "jitmemgen.exe" is available for you to generate your own EMBEDDED_DLL.cpp and EMBEDDED_PDB.cpp (if you want to replace the default embedded memory in this repo) and standalone .pdb/.dll/.hck (if you want to use standalone files as memory templates). By default embedded data provides approximately 16MB (8MB for code, 8MB for data). See "jitmemgen.exe" usage.
 
+更多关于“运行时生成不同容量模板”的算法与接口（默认会自动收敛到按对齐约束推导出的最小模板，再按需扩容），见 `doc/TEMPLATE_ARRAY_GENERATION.md`。
+如果你要离线重生更小的 embedded arrays（并裁剪 PDB 模板尾部 slack），可使用 `tools/jit_template_minimizer.py`。
+
 But my personal advices would be :
 
 If your **data** reaches the limit, I would try to replace static allocations by some heap allocations (when it comes to JIT, we are  generally not that picky on where memory is). 
